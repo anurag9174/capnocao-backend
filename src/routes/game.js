@@ -1,7 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../config/supabase');
-const { verifyToken } = require('../middleware/auth');
+const { verifyToken, needDb } = require('../middleware/auth');
+const { istDate } = require('../lib/dates');
+
+const MAX_QUESTIONS_PER_GAME = 50;
 
 // XP calculate karne ka logic
 const calculateXP = (score, total) => {
@@ -22,63 +25,59 @@ const getLevel = (totalXP) => {
   return 'Bhakt';
 };
 
-// Game submit karo
-router.post('/submit', verifyToken, async (req, res) => {
-  try {
-    const { score, totalQuestions, questionIds } = req.body;
-    const firebaseUid = req.user.uid;
+const asInt = (v) => (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '') ? Number(v) : NaN);
 
-    if (score === undefined || !totalQuestions) {
-      return res.status(400).json({ error: 'Score aur totalQuestions chahiye' });
+// Game submit karo
+router.post('/submit', verifyToken, needDb, async (req, res) => {
+  try {
+    const body = req.body || {};
+    // The app sends both camelCase and snake_case names.
+    const score = asInt(body.score);
+    const totalQuestions = asInt(body.totalQuestions ?? body.total_questions);
+
+    if (!Number.isInteger(score) || !Number.isInteger(totalQuestions) ||
+        totalQuestions < 1 || totalQuestions > MAX_QUESTIONS_PER_GAME || score < 0 || score > totalQuestions) {
+      return res.status(400).json({ error: 'Score aur totalQuestions sahi number chahiye (0 ≤ score ≤ totalQuestions)' });
     }
 
-    // User dhundo
+    const firebaseUid = req.user.uid;
     const { data: user, error: userError } = await supabase
       .from('users')
       .select('*')
       .eq('firebase_uid', firebaseUid)
-      .single();
+      .maybeSingle();
 
-    if (userError || !user) {
-      return res.status(404).json({ error: 'User nahi mila' });
-    }
+    if (userError) throw userError;
+    if (!user) return res.status(404).json({ error: 'User nahi mila' });
 
     const xpEarned = calculateXP(score, totalQuestions);
     const newTotalXP = (user.xp || 0) + xpEarned;
     const newLevel = getLevel(newTotalXP);
 
-    // Streak update karo
-    const today = new Date().toISOString().split('T')[0];
-    const lastPlayed = user.last_played;
-    const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
-    
+    // Streak, by the Indian calendar day.
+    const today = istDate();
+    const yesterday = istDate(1);
+    const lastPlayed = user.last_played ? String(user.last_played).slice(0, 10) : null;
+
     let newStreak = user.streak || 0;
-    if (lastPlayed === yesterday) {
-      newStreak += 1; // Streak continue
-    } else if (lastPlayed !== today) {
-      newStreak = 1; // Streak reset
-    }
+    if (lastPlayed === yesterday) newStreak += 1; // streak continues
+    else if (lastPlayed !== today) newStreak = 1; // streak broken (same day: unchanged)
+    else if (newStreak < 1) newStreak = 1;
 
-    // User update karo
-    await supabase
+    const { error: updateError } = await supabase
       .from('users')
-      .update({
-        xp: newTotalXP,
-        level: newLevel,
-        streak: newStreak,
-        last_played: today
-      })
-      .eq('firebase_uid', firebaseUid);
+      .update({ xp: newTotalXP, level: newLevel, streak: newStreak, last_played: today })
+      .eq('id', user.id);
+    if (updateError) throw updateError;
 
-    // Game session save karo
-    await supabase
-      .from('game_sessions')
-      .insert([{
-        user_id: user.id,
-        score,
-        xp_earned: xpEarned,
-        total_questions: totalQuestions
-      }]);
+    const { error: sessionError } = await supabase.from('game_sessions').insert([{
+      user_id: user.id,
+      score,
+      xp_earned: xpEarned,
+      total_questions: totalQuestions,
+    }]);
+    // XP is already saved; a missing history row shouldn't fail the whole submit.
+    if (sessionError) console.error('Game session save error:', sessionError);
 
     const leveledUp = newLevel !== user.level;
 
@@ -88,7 +87,7 @@ router.post('/submit', verifyToken, async (req, res) => {
       level: newLevel,
       streak: newStreak,
       leveledUp,
-      message: leveledUp ? `Badhai ho! Ab tum ${newLevel} ho!` : 'Game complete!'
+      message: leveledUp ? `Badhai ho! Ab tum ${newLevel} ho!` : 'Game complete!',
     });
   } catch (error) {
     console.error('Game submit error:', error);
@@ -96,20 +95,27 @@ router.post('/submit', verifyToken, async (req, res) => {
   }
 });
 
-// User ki game history
-router.get('/history/:userId', verifyToken, async (req, res) => {
+// Apni game history. (Earlier anyone could read anyone's history by changing the id in the URL;
+// now it always returns the signed-in player's own games. The :userId part is kept for old apps.)
+router.get(['/history', '/history/:userId'], verifyToken, needDb, async (req, res) => {
   try {
-    const { userId } = req.params;
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('id')
+      .eq('firebase_uid', req.user.uid)
+      .maybeSingle();
+    if (userError) throw userError;
+    if (!user) return res.json({ history: [] });
 
     const { data, error } = await supabase
       .from('game_sessions')
       .select('*')
-      .eq('user_id', userId)
+      .eq('user_id', user.id)
       .order('completed_at', { ascending: false })
       .limit(20);
 
     if (error) throw error;
-    res.json({ history: data });
+    res.json({ history: data || [] });
   } catch (error) {
     console.error('History fetch error:', error);
     res.status(500).json({ error: 'History nahi mili' });

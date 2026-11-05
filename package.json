@@ -1,18 +1,20 @@
 {
   "name": "capnocap-backend",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Cap or No Cap - Neta Edition Backend",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "nodemon src/index.js"
+    "dev": "nodemon src/index.js",
+    "test": "node --test --test-force-exit test/battle.test.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "cors": "^2.8.5",
     "@supabase/supabase-js": "^2.39.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
     "firebase-admin": "^12.0.0",
-    "dotenv": "^16.3.1"
+    "ws": "^8.22.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"

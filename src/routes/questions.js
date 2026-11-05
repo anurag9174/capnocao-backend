@@ -1,46 +1,49 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../config/supabase');
-const { verifyToken } = require('../middleware/auth');
+const { verifyToken, needDb } = require('../middleware/auth');
+const { shuffle, seededShuffle } = require('../lib/random');
+const { istDate } = require('../lib/dates');
 
-// 10 random questions lao (Classic mode)
-router.get('/random', verifyToken, async (req, res) => {
+const FIELDS = 'id, quote, neta_name, is_cap, category, audio_clip_url';
+const POOL_LIMIT = 1000;
+const DAILY_COUNT = 5;
+
+async function approvedPool() {
+  const { data, error } = await supabase
+    .from('questions')
+    .select(FIELDS)
+    .eq('approved', true)
+    .order('id', { ascending: true }) // stable order, so the daily pick is the same for everyone
+    .limit(POOL_LIMIT);
+  if (error) throw error;
+  return data || [];
+}
+
+// Random questions (Classic mode). The old version always returned the first rows of the table,
+// so players kept getting the same quotes; now it shuffles the whole approved pool.
+router.get('/random', verifyToken, needDb, async (req, res) => {
   try {
-    const count = parseInt(req.query.count) || 10;
-
-    const { data, error } = await supabase
-      .from('questions')
-      .select('id, quote, neta_name, is_cap, category, audio_clip_url')
-      .eq('approved', true)
-      .limit(count * 3); // Extra fetch karke shuffle karenge
-
-    if (error) throw error;
-
-    // Shuffle karo aur count jitne lo
-    const shuffled = data.sort(() => Math.random() - 0.5).slice(0, count);
-    res.json({ questions: shuffled });
+    const count = Math.min(Math.max(parseInt(req.query.count, 10) || 10, 1), 100);
+    const pool = await approvedPool();
+    res.json({ questions: shuffle(pool).slice(0, count) });
   } catch (error) {
     console.error('Questions fetch error:', error);
     res.status(500).json({ error: 'Questions nahi mile' });
   }
 });
 
-// Aaj ka daily question
-router.get('/daily', verifyToken, async (req, res) => {
+// Aaj ke daily questions: same set for everyone today (IST), changes every day.
+// Returns "questions" (what the app reads) and "question" (the first one, for older clients).
+router.get('/daily', verifyToken, needDb, async (req, res) => {
   try {
-    const today = new Date().toISOString().split('T')[0];
+    const today = istDate();
+    const pool = await approvedPool();
+    if (!pool.length) return res.status(404).json({ error: 'Aaj ka question nahi mila' });
 
-    // Simple: aaj ki date ke hisaab se ek fixed question
-    const { data, error } = await supabase
-      .from('questions')
-      .select('id, quote, neta_name, is_cap, category, audio_clip_url')
-      .eq('approved', true)
-      .limit(1);
-
-    if (error) throw error;
-    if (!data.length) return res.status(404).json({ error: 'Aaj ka question nahi mila' });
-
-    res.json({ question: data[0], date: today });
+    const seed = Number(today.replace(/-/g, ''));
+    const questions = seededShuffle(pool, seed).slice(0, DAILY_COUNT);
+    res.json({ questions, question: questions[0], date: today });
   } catch (error) {
     console.error('Daily question error:', error);
     res.status(500).json({ error: 'Daily question nahi mila' });
